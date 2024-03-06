@@ -5,6 +5,7 @@ import math
 import os
 import random
 import warnings
+import json
 
 import numpy as np
 import pandas as pd
@@ -126,12 +127,19 @@ class ParrotConditionModel(BertForSequenceClassification):
     ):
         if memory_key_padding_mask is None:
             memory_key_padding_mask = (attention_mask == 0)
-        memory = self.bert(input_ids,
+        memory_pool = self.bert(input_ids,
                            attention_mask=attention_mask,
                            token_type_ids=token_type_ids)[0]
+        memory_unpool = self.bert(input_ids,
+                           attention_mask=attention_mask,
+                           token_type_ids=token_type_ids)[1]
+        # print(self.tgt_tok_emb(label_input).shape) ([8, 6, 256])
+        # print(self.positional_encoding(self.tgt_tok_emb(label_input)).shape) ([8, 6, 256])
+        condition_position_encoding = self.positional_encoding(self.tgt_tok_emb(label_input))
+
         outs, attention_weights = self.decoder(
-            self.positional_encoding(self.tgt_tok_emb(label_input)),
-            memory,
+            condition_position_encoding,
+            memory_pool,
             tgt_mask=label_mask,
             tgt_key_padding_mask=label_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask)
@@ -142,7 +150,7 @@ class ParrotConditionModel(BertForSequenceClassification):
                             labels_out.reshape(-1))
 
         if self.use_temperature:
-            temp_memory = memory.reshape(
+            temp_memory = memory_pool.reshape(
                 -1,
                 self.config.max_position_embeddings * self.config.hidden_size)
             temp_memory = self.memory_regression_layer(temp_memory)
@@ -159,8 +167,8 @@ class ParrotConditionModel(BertForSequenceClassification):
                                         temperature.reshape(-1))
             # loss += 0.001*loss_reg
 
-            return loss, logits, attention_weights, loss_reg, temp_out
-        return loss, logits, attention_weights
+            return loss, logits, attention_weights, loss_reg, temp_out, condition_position_encoding, memory_pool, memory_unpool
+        return loss, logits, attention_weights, condition_position_encoding, memory_pool, memory_unpool
 
     def encode(self, input_ids):
         return self.bert(input_ids)[0]
@@ -451,7 +459,10 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
             os.makedirs(self.args.cache_dir, exist_ok=True)
 
         mode = "dev" if evaluate else "train"
-        if not args.use_temperature:
+        self.args.use_multiprocessing = False
+        self.args.use_multiprocessing_for_evaluation = False
+        # mode = "train"
+        if not args.use_temperature: 
             dataset = ClassificationDataset(
                 examples,
                 self.tokenizer,
@@ -487,6 +498,8 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
 
         if self.args.silent:
             show_running_loss = False
+        self.args.use_multiprocessing = False
+        self.args.use_multiprocessing_for_evaluation = False
 
         if self.args.evaluate_during_training and eval_df is None:
             raise ValueError(
@@ -514,6 +527,7 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
         train_dataset = self.load_and_cache_examples(train_examples,
                                                      verbose=verbose,
                                                      no_cache=True)
+        
         print('loaded train dataset {}'.format(
             train_dataset.examples['input_ids'].shape[0]))
         train_sampler = RandomSampler(train_dataset)
@@ -562,6 +576,15 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
 
         optimizer_grouped_parameters = []
         custom_parameter_names = set()
+        print('eval_df aaaa')
+        print(eval_df)
+        results = self.eval_model(
+                    eval_df,
+                    verbose=verbose and args.evaluate_during_training_verbose,
+                    silent=args.evaluate_during_training_silent,
+                    wandb_log=False,
+                    **kwargs,
+                )
         for group in self.args.custom_parameter_groups:
             params = group.pop("params")
             custom_parameter_names.update(params)
@@ -768,12 +791,19 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
                 mininterval=0,
             )
 
+            save_idx = -1
+            # print(len(batch_iterator))
+
             for step, batch in enumerate(batch_iterator):
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
 
                 inputs = self._get_inputs_dict(batch)
+                # inputs['labels'].shape  torch.Size([8, 7]) 
+                # inputs['input_ids'].shape)  torch.Size([8, 512])
+
+
                 if self.args.fp16:
                     with amp.autocast():
                         outputs = model(**inputs)
@@ -783,6 +813,35 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
                     outputs = model(**inputs)
                     # model outputs are always tuple in pytorch-transformers (see doc)
                     loss = outputs[0]
+
+                memory_pool = outputs[-1]
+                memory_unpool = outputs[-2]
+                condition_position_encoding = outputs[-3]
+                if step % 5000 == 0:
+                    if save_idx >= 0:
+                        with open(f'/data1/zhangyu/yuruijie/Parrot_save_files/rxn-encoding-pool/encoding-pool-checkpoint-{global_step}-epoch-{epoch_number}-idx-{save_idx}.json', 'w') as f:
+                            json.dump(rxn_encoding_pool, f)
+                        with open(f'/data1/zhangyu/yuruijie/Parrot_save_files/rxn-encoding-unpool/encoding-unpool-checkpoint-{global_step}-epoch-{epoch_number}-idx-{save_idx}.json', 'w') as f:
+                            json.dump(rxn_encoding_unpool, f)
+                        with open(f'/data1/zhangyu/yuruijie/Parrot_save_files/condition-encoding/condition-encoding-checkpoint-{global_step}-epoch-{epoch_number}-idx-{save_idx}.json', 'w') as f:
+                            json.dump(condition_encoding, f)
+                        with open(f'/data1/zhangyu/yuruijie/Parrot_save_files/input-labels/input-labels-checkpoint-{global_step}-epoch-{epoch_number}-idx-{save_idx}.json', 'w') as f:
+                            json.dump(inputs_labels, f)
+                        with open(f'/data1/zhangyu/yuruijie/Parrot_save_files/input-inputid/input-inputid-checkpoint-{global_step}-epoch-{epoch_number}-idx-{save_idx}.json', 'w') as f:
+                            json.dump(inputs_inputid, f)
+
+                    rxn_encoding_pool = memory_pool.tolist()
+                    rxn_encoding_unpool = memory_unpool.tolist()
+                    condition_encoding = condition_position_encoding.tolist()
+                    inputs_labels = inputs['labels'].tolist()
+                    inputs_inputid = inputs['input_ids'].tolist()
+                    save_idx += 1
+                else:
+                    rxn_encoding_pool = rxn_encoding_pool+memory_pool.tolist()
+                    rxn_encoding_unpool = rxn_encoding_unpool+memory_unpool.tolist()
+                    condition_encoding = condition_encoding+condition_position_encoding.tolist()
+                    inputs_labels = inputs_labels+inputs['labels'].tolist()
+                    inputs_inputid = inputs_inputid+inputs['input_ids'].tolist()
 
                 if args.n_gpu > 1:
                     loss = (
@@ -1003,6 +1062,7 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
                                         )
                         model.train()
 
+
             epoch_number += 1
             output_dir_current = os.path.join(
                 output_dir,
@@ -1025,11 +1085,6 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
                     wandb_log=False,
                     **kwargs,
                 )
-
-                self.save_model(output_dir_current,
-                                optimizer,
-                                scheduler,
-                                results=results)
 
                 training_progress_scores["global_step"].append(global_step)
                 training_progress_scores["train_loss"].append(current_loss)
@@ -1057,6 +1112,8 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
                         model=model,
                         results=results,
                     )
+                    
+
                 if best_eval_metric and args.early_stopping_metric_minimize:
                     if (best_eval_metric - results[args.early_stopping_metric]
                             > args.early_stopping_delta):
@@ -1068,6 +1125,7 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
                             model=model,
                             results=results,
                         )
+
                         early_stopping_counter = 0
                     else:
                         if (args.use_early_stopping
@@ -1108,6 +1166,7 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
                             model=model,
                             results=results,
                         )
+
                         early_stopping_counter = 0
                     else:
                         if (args.use_early_stopping
@@ -1191,10 +1250,11 @@ class ParrotConditionPredictionModel(SmilesClassificationModel):
             eval_df["labels"].tolist(),
         )
         os.makedirs(eval_output_dir, exist_ok=True)
+        silent=True
         eval_dataset = self.load_and_cache_examples(eval_examples,
                                                     evaluate=True,
                                                     verbose=verbose,
-                                                    silent=silent,
+                                                    silent=args.silent or silent,
                                                     no_cache=True)
         eval_sampler = SequentialSampler(eval_dataset)
         eval_dataloader = DataLoader(eval_dataset,

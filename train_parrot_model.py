@@ -74,5 +74,5 @@ if __name__ == '__main__':
                         type=str)
 
     parser_args = parser.parse_args()
-    debug = False
+    debug = True
     main(parser_args, debug)
